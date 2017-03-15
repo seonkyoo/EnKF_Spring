@@ -2,21 +2,27 @@
 <head>
 <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
 <script src="VectorNew.js"></script>
+<script src="math.js"></script>
+<script src="Numeric.js"></script>
 <script src="fn_EnKF.js"></script>
 <script>
 
 	// var context,canvas;
 	var bodies  = [];    // Reference Two-body System (to observed)
-	var bodiesEn = [];   // Ensemble of Two-body Systems
+	var bodiesE = [];   // Ensemble of Two-body Systems
 	var springs = [];    // Reference Spring (with true stiffness)
-	var springsEn = [];  // Ensemble of Springs (with random stiffnesses)
+	var springsE = [];  // Ensemble of Springs (with random stiffnesses)
 	var gravity = 0;
 	var stiffness = [1.2];
-	var Ne = 20;		 // Number of Ensemble Members
+	var Ne = 1000;		 // Number of Ensemble Members
 	var stiffnessEn = [];// Initial Ensemble of Stiffness 
 	for(var i=0; i<Ne; i++){
 		stiffnessEn.push(Math.exp(randn_bm()));
 	}
+	maxStif = Math.max(...stiffnessEn);
+	minStif = Math.min(...stiffnessEn);
+	maxLength = 120;
+	minLength = 20;
 	var deltaT  = 0.1;
 	var timer   = null;
 	var alpha = 0.0;
@@ -25,29 +31,25 @@
 	var R2 = (1-alpha*deltaT/2);
 	var counter = 0;
 	var radius = 5;
+	var std = 0.1;
 
-	// Gaussain variable generator using Box-Muller transform.
-	function randn_bm() {
-	    var u = 1 - Math.random(); // Subtraction to flip [0, 1) to (0, 1].
-	    var v = 1 - Math.random();
-	    return Math.sqrt( -2.0 * Math.log( u ) ) * Math.cos( 2.0 * Math.PI * v );
-	}
 
 	window.onload=getCanvas;    
 	function getCanvas(){
 		canvas = document.getElementById("myCanvas");
 		context=canvas.getContext("2d");
 		DrawBox(0,0,canvas.width,canvas.height);
+		// Truth (reference)
 		bodies    = generateBodies(1,[600],[30]);
-
 		var posX = []; var posY = [];
 		for(var i = 0; i<Ne; i++){
 			posX.push(200);
 			posY.push(24*i+100);	
 		}
-		bodiesEn  = generateBodies(Ne,posX,posY);
 		springs   = generateSprings(bodies,stiffness);
-		springsEn = generateSprings(bodiesEn,stiffnessEn);
+		// Ensemble 
+		bodiesE  = generateBodies(Ne,posX,posY);
+		springsE = generateSprings(bodiesE,stiffnessEn);
 	}
 
 	// Generate two-body systems as many as nSystem
@@ -80,27 +82,81 @@
 		bodies.forEach(function(bodiesOne){bodiesOne.forEach(drawBody);});
 		springs.forEach(drawSpring);
 
-		bodiesEn.forEach(function(bodiesOne){bodiesOne.forEach(zeroForce);});
-		springsEn.forEach(updateSpringForces);
-		bodiesEn.forEach(function(bodiesOne){bodiesOne.forEach(updatePosition);});
-		bodiesEn.forEach(function(bodiesOne){bodiesOne.forEach(drawBody);});
-		springsEn.forEach(drawSpring);
+		bodiesE.forEach(function(bodiesOne){bodiesOne.forEach(zeroForce);});
+		springsE.forEach(updateSpringForces);
+		bodiesE.forEach(function(bodiesOne){bodiesOne.forEach(updatePosition);});
+		bodiesE.forEach(function(bodiesOne){bodiesOne.forEach(drawBody);});
+		springsE.forEach(drawSpring);
 
-		var x = [];
-		for (var i = 0; i < Ne; i ++) {
-			x[i] = Math.log(springsEn[i].stiffness);
+		histo(springsE);
+		if (numeric.mod(counter,4)==0){
+		// if (counter>1){
+			// Observation & Predictionn
+			var obs =  springs[0].masses[1].pos.x - springs[0].masses[0].pos.x; // spring lengthh
+			var predictE = [];
+			var parameterE = [];
+			springsE.forEach(function(spring){
+				predictE.push(spring.masses[1].pos.x-spring.masses[0].pos.x);
+				parameterE.push(Math.log(spring.stiffness));
+			});
+			var meanPredict = numeric.sum(predictE)/Ne; // HA = D;
+			var meanParameter = numeric.sum(parameterE)/Ne;
+
+
+			var stateMat = [predictE, parameterE]; 
+			var stateMatM = [meanPredict, meanParameter];// Am = mean(A,2);
+			var stateMatC = [numeric.addVS(predictE,-meanPredict),numeric.addVS(parameterE,-meanParameter) ]; // Ac = A - repmat(Am,1,nmembers);    
+    
+			var S = predictE.map(function(val){
+				return (val - meanPredict) / Math.sqrt(Ne-1);
+			});// S = (HA-repmat(mean(HA,2),1,nmembers))/sqrt(nmembers-1);
+			// S: 1X20
+			
+			// update incorporating covariance localization
+    		var P1 = numeric.dot(stateMatC, numeric.transpose([S])); // P1 = (Ac * S'); 2X1
+    		var P2 = numeric.add(numeric.dot([S], numeric.transpose([S])), std); // P2 = S*S' + diag(R);   1X1
+		    
+		    var W = numeric.dot(P1,numeric.inv(P2)); // W = P1 / P2; 2X1
+
+		    var pertb = [];
+	    	for(var i=0; i<Ne; i++){
+				pertb.push(Math.exp(randn_bm()*0.01));
+			}
+
+	        var mismatch = numeric.sub(numeric.add(predictE,pertb), numeric.rep([Ne],obs)); // 1X20
+
+		    // U = A + sqrt(nmembers-1) .\ (W * (Y - HA));  (2X1) X (1X20)
+    												
+			var stateMatUpdate = numeric.add(stateMat, 
+				numeric.mul(numeric.dot(W,[mismatch]) , numeric.rep([2,Ne],1/Math.sqrt(Ne-1)))
+			);
+
+
+			springsE.forEach(function(spring,index){
+				var candLength = stateMatUpdate[0][index];
+				if (candLength < minLength) {
+					// spring.masses[1].pos.x  = spring.masses[0].pos.x + minLength;
+					spring.masses[1].pos.x  = spring.masses[0].pos.x + springs[0].masses[1].pos.x - springs[0].masses[0].pos.x; 
+					spring.masses[1].velocity.x = springs[0].masses[1].velocity.x; 
+				} else if(candLength > maxLength){
+					// spring.masses[1].pos.x  = spring.masses[0].pos.x + maxLength;
+					spring.masses[1].pos.x  = spring.masses[0].pos.x + springs[0].masses[1].pos.x - springs[0].masses[0].pos.x;
+					spring.masses[1].velocity.x = springs[0].masses[1].velocity.x; 
+				} else {
+					spring.masses[1].pos.x = spring.masses[0].pos.x + candLength; 
+				}
+
+
+			 	var candStif = Math.exp(stateMatUpdate[1][index]);
+				if (candStif < minStif) {
+					spring.stiffness = minStif;
+				} else if(candStif > maxStif){
+					spring.stiffness = maxStif;
+				} else {
+					spring.stiffness = candStif; 
+				}
+			});
 		}
-
-		var data = [
-		  {
-		    x: x,
-		    type: 'histogram',
-			marker: {
-		    color: 'rgba(100,250,100,0.7)',
-			},
-		  }
-		];
-		Plotly.newPlot('histo', data);
 
 	}
 
